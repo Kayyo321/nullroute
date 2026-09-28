@@ -1,179 +1,214 @@
-# Nullroute — project specification
+# Nullroute — native Tor client daemon for Nullpath
 
-**Status:** design, version 1.0, 2026-09-28. This is the implementation contract for the separate `Kayyo321/nullroute` repository. It specifies software that has **not** been implemented, tested, audited, or deployed. Do not describe it as providing proven anonymity.
+**Status:** design specification v3.1, 2026-09-28. This repository contains only this specification. No daemon, browser integration, test suite, audit, or proven anonymity has been delivered.
 
-## 1. Purpose and fixed decisions
+## 1. Architecture and hard compatibility boundary
 
-Nullroute is a local daemon and an independently operated I2P exit service for public-web browsing from [Nullpath](https://github.com/Kayyo321/nullpath/tree/build/windows-native). Nullpath is a LibreWolf/Firefox-based, currently Windows-only browser. Its `build/windows-native` branch currently has three separate profiles: I2P sites, public web through a conventional I2P outproxy, and direct web. Nullroute will eventually **replace the direct-web profile's network path**, while leaving the I2P-sites and existing outproxy profiles available. Browser integration belongs in the separate Nullpath repository; this repository contains the daemon, exit service, protocol, test fixtures, and their documentation.
+Nullroute will be a **new Rust daemon implemented here** and bundled with Nullpath. It will implement the public Tor client protocol itself: authenticated directory bootstrap, guard and path selection, TLS channels, circuit creation, onion encryption, relay cells, stream multiplexing, and flow control. It will not embed Arti or launch C Tor. It may use audited TLS and cryptographic primitives; “from the ground up” means owning the Tor client protocol logic, not inventing ciphers.
 
-The chosen design uses an existing I2P router's tunnels and garlic-routing machinery through **SAM v3**. Nullroute does not implement a new router, cryptosystem, or mix network. The client accepts only a loopback HTTP proxy connection from Nullpath, opens an I2P streaming connection to a selected Nullroute exit Destination, and asks that exit to make the final TCP connection to the public website. An exit is a deliberately installed service with its own I2P Destination and clearnet connection. Ordinary I2P relay participants do **not** become exits.
+For clearnet, Nullroute will automatically choose a Tor exit from the verified consensus. For a v3 `.onion` address, it will use Tor's onion-service introduction and rendezvous protocol **without a clearnet exit**. Users will not choose an I2P outproxy, Tor exit, country, or pinned route. Ordinary Tor infrastructure must accept Nullroute's **standard Tor protocol cells**.
+
+**Public-web Tor circuits use onion routing, not I2P garlic routing.** Existing Tor relays remove one specified layer from each relay cell; exits expect Tor stream commands. Replacing either with garlic cloves would break interoperability. Putting a garlic envelope inside a Tor stream would need a cooperating gateway to unpack it before clearnet access; ordinary Tor exits do not do that. Nullpath's separate `.i2p` profile continues using I2P garlic routing. Tor stream multiplexing is not to be renamed garlic routing. A genuine hybrid would require a custom gateway or Tor protocol change and would not satisfy the requirement to work with all existing Tor infrastructure.
 
 ```
-Nullpath "Public web via Nullroute" profile
-  -> 127.0.0.1:14500 HTTP proxy (nullroute client)
-  -> 127.0.0.1:7656 SAM v3 (local I2P router; configurable)
-  -> I2P client tunnels -> I2P exit tunnels
-  -> Nullroute exit service -> exit-side DNS -> TCP 80/443 -> website
+Nullpath public-web profile
+  -> authenticated SOCKS5, 127.0.0.1:14500
+  -> nullroute.exe, our Tor client implementation
+  -> TLS channel to persistent Tor guard
+  -> clearnet: standard Tor circuit -> automatic exit -> site
+  -> .onion: introduction + rendezvous circuits -> onion service
+
+Nullpath I2P-sites profile
+  -> existing I2P router and garlic-routed tunnels -> .i2p destination
 ```
 
-There is no usable exit network until an independent operator deploys an exit and the user explicitly configures its Destination. Running the client alone does not supply an exit. Running the exit on the same machine/network as the browser does not create an independent anonymity boundary. One exit does not provide Tor-like diversity, anonymity-set size, or censorship resistance. Multiple configured exits improve availability but do not by themselves justify a Tor-equivalence claim.
+Nullroute is a client, not a relay, directory authority, exit, I2P router, or VPN. No private Tor network, modified exit, I2P-to-Tor gateway, or designated outproxy is required.
 
-### Version 1 scope
-
-| Area | Decision |
+| Scope | Fixed decision |
 | --- | --- |
-| Platform | Windows 10/11 x64 client and exit first; architecture must keep platform-specific IPC and packaging separate so Linux support can follow. |
-| Language | Rust stable; one workspace with `nullroute-client`, `nullroute-exit`, `nullroute-protocol`, and `nullroute-testkit` crates. No unsafe Rust in protocol, proxy, or policy code. |
-| Router | Reuse a user-managed or Nullpath-managed I2P router exposing SAM v3 on loopback. SAM is never opened to a LAN or public interface by Nullroute. Nullroute does not alter router configuration without an explicit setup action in Nullpath. |
-| Transport | One SAM `STYLE=STREAM` session per running client; one persistent exit `STYLE=STREAM` session. One I2P stream per browser TCP connection. The router selects and maintains I2P tunnels. |
-| Public-web protocol | HTTP/1.1 forward proxy for `http://` and `CONNECT` for `https://`; TCP ports 80 and 443 only. No UDP, QUIC/HTTP3, generic SOCKS, mail, arbitrary ports, or remote DNS from the client. |
-| Exit discovery | Manual, explicit list of pinned `.b32.i2p` exit Destinations. No automatic directory, fallback to conventional outproxy, or clearnet bootstrap URL in v1. |
-| Default state | Disabled at launch. Proxy listener starts only after explicit connect; if a saved list has no usable exit, requests fail. Never silently use a direct socket or system proxy. |
-| Browser split | Nullpath owns profile separation and its existing channel filter/request blocker. Nullroute owns proxy-to-I2P transport and exit policy. Neither component's own tests substitute for end-to-end leak tests. |
+| Initial platform | Windows 10/11 x64, per-user daemon, no elevated service. |
+| Language | Rust stable. Deny unsafe code in project-owned parser, protocol, proxy, policy, and state crates. |
+| Tor compatibility | Conform to the versioned Tor specifications in §13. Unknown mandatory protocol features fail closed. |
+| Browser transport | Authenticated SOCKS5 CONNECT with DNS names or validated v3 `.onion` names; TCP 443 and 80 under the target-specific policy in §10. No BIND, UDP, IP literals, or generic proxy service. |
+| Exit choice | Verified consensus, Tor guard rules, path constraints, bandwidth weights, and exit policies. No manual exit or fallback. |
+| Startup | Nullpath starts disconnected. Explicit connect initiates bootstrap. |
 
-## 2. Threat model and claims
+## 2. Security model and claims
 
-**Intended protection:** a website and its network see the selected exit's public IP instead of the user's IP; an ordinary local access provider sees I2P router traffic rather than each website connection. The exit is an explicit trust boundary. Browser fingerprint, account login, cookies, uploaded data, URL contents visible to the website, malware, traffic correlation, compromised client/router/exit, and a global observer are outside this guarantee. The exit knows the requested host and port; for plaintext HTTP it can read and alter the full exchange. For HTTPS it can see metadata such as target host, timing, volume, and potentially TLS SNI, but must not terminate or forge browser TLS. A compromised exit can block, delay, or route traffic maliciously; browser certificate validation is essential.
+A correctly routed connection exposes a Tor exit IP to the website, not the user's IP. The guard can see the user's IP, while the exit can see the destination and traffic metadata. HTTPS protects browser-to-site content after the exit. A Tor exit can inspect or alter plaintext HTTP and can block or fail a request. Local network observers may recognize Tor traffic.
 
-I2P routers must contact peers and possibly reseed services over ordinary network connections. That is router traffic, not a website request escaping Nullroute. A user-operated exit or colluding exit and network observer may correlate the user. Exit operators face abuse complaints and legal/operational risk; exit installation must be opt-in and separately documented. Product copy must say **"public web through I2P and a selected Nullroute exit"**, not "anonymous", "untraceable", or "like Tor" as a safety promise. Do not claim anonymity before independent review and real network measurements.
+This is **not a guarantee of anonymity**. Accounts, cookies, fingerprints, extensions, external applications opening downloads, uploaded data, malware, compromised relays, and traffic correlation can identify or link activity. A new Tor client has substantial protocol risk. A browser is not equivalent to Tor Browser merely because it uses Tor; the Tor Project warns of DNS, WebRTC, and fingerprint leaks in other browsers. The UI must say **experimental** until implementation, leak tests, protocol conformance, independent cryptographic/security review, and fingerprint review pass. Do not advertise “anonymous browsing,” “untraceable,” or “Tor Browser equivalent.”
 
-### Invariants (required in every release)
+### Non-negotiable invariants
 
-1. The client process has no code path that opens a public-web socket or resolves a public-web hostname. Its outbound sockets are limited to its configured loopback SAM endpoint and local control channel. On SAM or exit failure, browser traffic fails closed.
-2. Proxy listener binds exactly `127.0.0.1` and `::1` only when the corresponding address is explicitly enabled; v1 defaults to IPv4 `127.0.0.1` only. Never bind `0.0.0.0` or `::`.
-3. A hostname cannot be handed to Windows/system DNS on the client. The exit resolves names after validating them. The browser must use the proxy for both HTTP and HTTPS, with proxy DNS behavior verified by packet capture.
-4. Exit Destination is pinned by its full 52-character `.b32.i2p` name (or full I2P Destination internally). No DNS-like short name or unverified substitution is accepted for an exit.
-5. Any route, session, proxy, policy, or exit change closes existing client proxy connections before new settings take effect. There is no connection reuse across exit changes.
-6. Web content, extensions, and ordinary local processes cannot issue privileged daemon control requests. Loopback proxy is not a general-purpose local forward proxy in production; see access control below.
-7. Local process, browser, and exit logs never store requested hostnames, URLs, HTTP headers/bodies, peer Destination, or user IP by default.
+1. Nullpath public-web processes send no browsing-related non-loopback DNS, TCP, or UDP. Their only public-web proxy is Nullroute on loopback. Failure never activates direct networking, a system proxy, an I2P outproxy, or another browser profile.
+2. Nullroute never resolves a requested website with Windows DNS or opens a direct website socket. It sends clearnet hostnames through Tor exit streams for exit-side DNS. It resolves `.onion` identities only through Tor's HSDir and rendezvous protocol; an onion address is never sent to ordinary DNS or a clearnet exit.
+3. Nullroute's non-loopback sockets contact only Tor directory and relay endpoints as required by verified directory data. Built-in fallback addresses are contact hints for obtaining **validated** directory material, not authority to trust an exit.
+4. The SOCKS listener binds only `127.0.0.1:14500` while ready and authenticates every connection. Web content and extensions cannot read its secret or use the control pipe.
+5. Separate top-level browsing contexts cannot share Tor circuits or browser connection pools. Guard state persists across launches.
+6. Failed signatures, certificates, handshakes, relay digests, flow-control checks, and protocol state transitions destroy the affected channel or circuit; they never trigger permissive parsing.
+7. Default logs never contain hostnames, URLs, requested IPs, proxy credentials, context IDs, circuit paths, or content.
 
-## 3. Repository layout and deliverables
+### Nullroute-specific protections and usability features
 
-The initial repository contains only this `PROJECT.md`. Implementation must later add:
+These are requirements for our daemon and browser integration, not claims that Tor lacks them or that adding them guarantees anonymity:
+
+| Feature | Exact behavior and benefit | Boundary |
+| --- | --- | --- |
+| Target-aware routing | Classify a validated destination as `CLEARNET` or `ONION_V3` before circuit selection. Clearnet gets an exit circuit and exit-side DNS; onion gets HSDir, introduction, and rendezvous circuits. Wrong-class circuit attachment is a fatal request error. | Prevents onion names from reaching DNS or exits. |
+| Context-bound circuit pools | One random browser context ID maps to a separate circuit pool; no circuits, stream IDs, HTTP connections, TLS sessions, or browser storage cross contexts. Rotate on top-level navigation and identity reset. | Reduces cross-site linkage; it does not defeat login or fingerprint tracking. |
+| Authenticated local handoff | Per-launch SOCKS and control secrets, process-bound IPC, strict loopback binding, replay protection, and session rotation. | Prevents webpages and unauthenticated local clients from commandeering the Tor client. |
+| Fail-closed route monitor | Browser channel filter and daemon state jointly block traffic whenever Tor is unavailable, the proxy owner changes, or a target cannot be classified. Record a reason code, never a destination. | A local administrator or compromised browser remains outside this boundary. |
+| Verified directory and durable guards | Reject unsigned/stale consensus data, validate descriptors, preserve guard state, and do not rotate guards for a failed page. | Reduces directory substitution and needless guard exposure. |
+| Onion identity verification | Decode v3 addresses, verify version/checksum and descriptor signatures, derive the correct blinded identity and subcredential, and authenticate the service rendezvous handshake. | A syntactically valid address does not prove the site's human-readable identity. |
+| Bounded resource behavior | Limit concurrent streams, context count, handshake time, buffers, descriptor sizes, and retry work; cancel slow or malformed peers. | Protects the local daemon from resource exhaustion; it does not prevent network-wide denial of service. |
+| Privacy-preserving diagnostics | Report bootstrap stage, destination class, and stable failure code; suppress hostnames, paths, circuits, and payload in default logs. | Diagnostic detail is intentionally limited. |
+| Secure update and recovery | Verify signed bundle manifest and daemon version before launching; fail closed on browser/daemon protocol mismatch; keep last valid guard state and validated directory cache across updates. | Software update signing and host compromise remain trust boundaries. |
+| Accessible error handling | Show separate Tor bootstrap, onion descriptor, onion introduction/rendezvous, exit-policy, and site failures, with a retry action that never changes routing mode. | A failure explanation is not proof that a site is safe or reachable. |
+| Bounded reachability retry | If a clearnet stream is refused before payload, try at most one other eligible exit on a new circuit within the same isolation context and guard policy. If an onion introduction point fails before rendezvous, try at most one other verified point from the descriptor. | Improves availability without reusing or replaying browser data; it cannot force a blocked site to accept Tor. |
+
+Neither extra encryption around ordinary Tor cells nor arbitrary cover traffic is a default feature. Either could make Nullroute traffic more distinctive or impair compatibility. Any padding or timing change must use negotiated Tor protocol mechanisms and pass network-load and fingerprint review before release.
+
+## 3. Repository ownership
 
 ```
-Cargo.toml                    workspace, locked dependencies
+Cargo.toml
 Cargo.lock
-crates/protocol/              wire parser/serializer and limits
-crates/client/                loopback proxy, SAM adapter, exit selection, control IPC
-crates/exit/                  SAM acceptor, egress policy, DNS, TCP relay
-crates/testkit/               fake SAM, fake exit, local HTTP/TLS origin
-tests/                        integration and fault-injection tests
-docs/                         operator guide, browser integration, threat model, release evidence
-packaging/windows/            signed-binary/service packaging scripts
+crates/daemon/             lifecycle, control pipe, SOCKS5, bounded relay
+crates/tor-directory/      consensus, certificates, descriptors, cache
+crates/tor-path/           guard state, path constraints, exit policies
+crates/tor-channel/        TLS, link negotiation, cells, channel state
+crates/tor-circuit/        ntor, hop keys, onion layers, circuit state
+crates/tor-stream/         BEGIN/DATA/END, SENDME, stream multiplexing
+crates/tor-onion/          v3 address, HSDir, descriptor, intro/rendezvous client
+crates/policy/             IDNA and target restrictions
+crates/testkit/            fake authorities, relays, exits, origins
+tests/                     conformance and fault-injection tests
+docs/                      threat model, browser contract, release evidence
+packaging/windows/         signed bundle and per-user installation
 ```
 
-`PROJECT.md` remains the normative architecture. Protocol changes require a version bump and an interoperability test. Generated artifacts, router keys, logs, and user configuration must never be committed. The exit is a separate executable and **must not be installed or enabled by the ordinary browser/client installer**.
+This repository owns the Tor client. `Kayyo321/nullpath` owns browser patches and installer integration. No `arti-client`, C Tor runtime, `nullroute-exit`, SAM connector, or I2P outproxy directory belongs in this design. Pin dependency and Tor-spec source revisions in the lockfile and release manifest. Never commit user state, keys, secrets, captures, or logs.
 
-## 4. Client configuration and lifecycle
+## 4. Directory bootstrap and trust
 
-Use a versioned TOML configuration file under `%LOCALAPPDATA%\Nullroute\client\config.toml`, created with user-only ACLs. Values and defaults:
+Bundle Tor's maintained directory authority identity keys and fallback endpoints with source revision and hash in the signed build manifest. Change authority keys only through a signed Nullpath update. Do not accept key or directory overrides from websites, environment variables, unsigned local files, or downloaded configuration. A fallback endpoint's IP is not proof of its directory answer.
+
+On explicit `start`:
+
+1. Load cached consensus, certificates, microdescriptors, and guard state from `%LOCALAPPDATA%\Nullroute\state\` with strict length, schema, signature, and time validation. Ignore corrupt directory cache; treat corrupt guard state as a blocking error until documented recovery. Never use an expired consensus for new exit streams.
+2. Fetch directory data over the Tor directory transport supported by the pinned Tor specification. Enforce byte, decompression, and time limits before parsing. Verify authority identity/signing certificates, a sufficient consensus signature set under current directory rules, validity times, and clock tolerance. A single unsigned server response never authorizes relays.
+3. Fetch microdescriptors by digest; verify each against the consensus. Reject missing identity/onion keys and incompatible protocol versions. Accept consensus parameters only within reviewed bounds.
+4. Persist verified objects by atomic replace under current-user-only ACLs. Never put requested website hosts in directory cache.
+
+`READY` requires valid directory state, a usable guard, and the ability to build compatible circuits, not just directory reachability. Track `clearnet_available` and `onion_available` separately. The SOCKS listener opens if either capability is available; a request for an unavailable capability gets a class-specific failure. Wrong clock, missing signatures, unrecognized mandatory protocol versions, or no usable guard blocks both. No eligible exit blocks clearnet only; failure to reach HSDirs or rendezvous points blocks onion only. Refresh directory data under the Tor specification's freshness rules. Test rollover, certificate rotation, invalid signatures, stale caches, and malicious responses.
+
+## 5. Guard, path, and automatic exit selection
+
+Implement the Tor guard specification's sampled, confirmed, primary, retry, and persistence rules. A website failure must not rotate the guard. Store guard state under the current user's ACL; migrate it only with a versioned converter.
+
+For an exit circuit, choose the exit **first** from verified, running, valid relays whose exit policy permits the requested port and whose protocol versions are compatible. Choose middle and guard under Tor's path rules: no repeated relay, declared family overlap, or disallowed subnet overlap; honor consensus bandwidth weights and restrictions. Use an OS-seeded cryptographic RNG with unbiased sampling. If no valid path exists, fail. Do not permit country selection, exit pinning, or a Nullroute-operated preference list.
+
+A clearnet circuit may carry multiple streams only when their browser isolation context matches and its exit supports each target port. Onion descriptor, introduction, and rendezvous circuits are separate from clearnet exit circuits and from other context IDs. Retire circuits under Tor's specified age and failure rules; do not promise a fresh IP per page. “New identity” closes streams and rotates browser isolation contexts, but does not erase guard history or guarantee a new exit IP. The first release does not tune circuit length or network weights.
+
+## 6. Tor channel and circuit protocol
+
+A channel is a TLS connection to a consensus-identified guard. Implement Tor link negotiation: TLS setup, `VERSIONS`, relay `CERTS` verified against the consensus identity, applicable `AUTH_CHALLENGE`, `NETINFO`, negotiated cell framing, and required link padding. Reject identity mismatch, oversized variable cells, duplicate/out-of-order handshake cells, and unsupported mandatory versions. Ordinary TLS certificate validation alone is not Tor relay identity validation.
+
+Parse cell lengths before allocation. Key circuits by channel and circuit ID; scope stream IDs to a circuit. Use typed states for negotiating/open/closed channels and handshaking/open/closed circuits. An invalid cell for a state closes the affected resource. A restarted channel never reuses old cipher state, counters, or stream mappings. Use OS CSPRNG output through audited libraries; never log keys or nonces.
+
+Build a three-hop exit circuit with `CREATE2`/`CREATED2` and `RELAY_EXTEND2`/`RELAY_EXTENDED2`, using the specified ntor handshake. Authenticate each hop's consensus identity and onion key, derive independent forward/backward keys and digest state, and validate every response. Wrap outgoing relay-cell bodies in hop encryption layers in reverse path order; remove incoming layers in path order and validate recognition/digest at the addressed hop. A digest or handshake mismatch destroys the circuit. No extra garlic clove, custom cell command, or substituted encryption is sent to a standard Tor relay.
+
+## 7. Tor streams, DNS, and flow control
+
+For a validated **clearnet** hostname, open `RELAY_BEGIN` with the hostname and permitted port on an exit circuit. Wait for `RELAY_CONNECTED` before replying SOCKS success. For an onion target, follow §7A and open the application stream only after service rendezvous authentication. Relay bounded `RELAY_DATA`; process `RELAY_END` as stream closure. Implement circuit and stream `SENDME` flow control, including authenticated forms and negotiated parameters required by the supported network. Never permit an unacknowledging peer to grow queues without bound.
+
+Each browser socket maps to one Tor stream. Caps: 128 streams globally, 32 per isolation context, 256 contexts, 64 KiB application buffer in each stream direction. Timeouts: 5-second SOCKS handshake, 30-second Tor stream open including retries, 120-second idle, 30-minute hard lifetime. Propagate half-close and cancellation. A refused clearnet stream may try **one** other consensus-eligible exit on a new circuit, preserving the same context and guard rules, only before SOCKS success or browser payload. A failed onion introduction may try **one** other verified introduction point before rendezvous. Never replay HTTP bodies after forwarding starts or loop through exits until a site accepts traffic. Unknown relay errors become generic SOCKS failures.
+
+For clearnet, the Tor exit resolves hostnames and applies its exit policy. Nullroute cannot inspect the exit's eventual DNS answer and cannot claim to prevent every exit-side DNS rebinding case. Nullroute blocks literals and special-use names locally. For `.onion`, there is no exit-side DNS or clearnet exit. TLS, when used, stays end-to-end between Nullpath and the destination; Nullroute never installs a root CA or intercepts certificates.
+
+## 7A. Version 3 onion-service client
+
+Support **public v3 onion services** in the first release. The 56-character address label plus `.onion` is parsed as lower-case base32, decoded into the 32-byte Ed25519 identity public key, two-byte checksum, and version byte. Require version 3 and verify the checksum formula in the Tor onion-address specification before any network request. Reject legacy 16-character v2 addresses, subdomains of onion addresses, malformed base32, mixed encodings, and IP-literal lookalikes. An onion address is an identity key, not a DNS hostname; it must never be passed to `RELAY_BEGIN` on a clearnet exit circuit or to the OS resolver.
+
+For a valid address, derive the current time-period blinded key and subcredential under the pinned v3 rendezvous specification. Fetch descriptors only from the responsible consensus-derived HSDir set through Tor circuits, with length/time caps. Validate descriptor signatures, lifetime, revision counter, encrypted layers, introduction-point keys, and onion identity binding before using an introduction point. A bad or stale descriptor is never accepted because one HSDir returned it. Cache validated descriptors in memory by onion identity and time period for at most their specified validity; clear them on identity reset and shutdown, and never log addresses or write descriptor queries to disk.
+
+Choose a rendezvous relay under Tor's path rules and establish a dedicated rendezvous circuit. Build a separate introduction circuit to a verified introduction point; send the standard `INTRODUCE1` payload containing a fresh random rendezvous cookie and the required ntor handshake material. Verify introduction acknowledgement and the service's `RENDEZVOUS2` response, derive the end-to-end service keys, and only then attach a stream. For service streams use the onion-service `RELAY_BEGIN` target encoding required by the specification, not the clearnet hostname. Never return SOCKS success before the service accepts the stream. Intro and rendezvous circuits are not reused across different browser context IDs or onion identities. The rendezvous relay is **not** a clearnet exit and does not resolve the name.
+
+Onion service client authorization is **out of scope for v3.1**. A descriptor requiring restricted discovery returns `ONION_AUTH_REQUIRED`; the daemon must not attempt a clearnet fallback or pretend the service is missing. A later revision may add protected credential import and storage. Onion pages may use `http://<v3-address>.onion` on port 80 because Tor's onion-service protocol provides end-to-end identity-bound encryption; Nullpath must identify this as an onion origin and must not grant a clearnet HTTP exception. Onion HTTPS on port 443 still receives normal browser certificate validation. No downgrade from `https://` to `http://` happens automatically.
+
+## 8. Authenticated SOCKS and privileged control
+
+Accept only SOCKS5 `CONNECT` with RFC 1929 username/password authentication and domain-name address type. Classify the domain as clearnet or v3 onion before opening any circuit. Reject no-auth, SOCKS4, BIND, UDP, IP address types, malformed length, pre-connect extra bytes, and ports other than 443/80. Bind only `127.0.0.1:14500` in `READY`; a port collision blocks startup. Replies use a generic bound address and no circuit/exit details.
+
+Nullpath's privileged parent launches the daemon with an inherited one-time handle containing independent random 256-bit proxy and control secrets. Secrets stay in memory. The browser network process receives only the proxy secret through privileged IPC. For each top-level document the browser generates a random 128-bit context ID; subresources, frames, workers, redirects, and downloads inherit it. A new top-level navigation creates a new ID. SOCKS username is `n3.` plus the 22-character unpadded base64url context ID. SOCKS password is the 43-character unpadded base64url HMAC-SHA-256 of `"nullroute-socks-v3" || browser_session_id || context_id` under the proxy secret. Verify in constant time and map each ID to an isolated circuit pool. Expire a context after 10 idle minutes with no streams. Browser restart rotates secrets and invalidates old streams.
+
+Control uses `\\.\pipe\nullroute-control-<user SID>` with current-user/LocalSystem ACLs, remote clients disabled, verified peer SID, and per-message HMAC under the control secret. Frames are 4-byte big-endian length plus UTF-8 JSON, maximum 16 KiB. Each message has protocol version, request ID, increasing sequence number, and MAC over canonical typed fields. Reject replay, unknown fields, duplicate keys, wrong MAC, and version mismatch. Commands are exactly `status`, `start`, `stop`, `register_browser`, and `shutdown`. `status` returns state, bootstrap category, stream count, and build ID only. `register_browser` installs a random 128-bit session ID and closes old streams. No command sets exits, authority keys, paths, or target policy.
+
+The daemon is a same-user child of the privileged Nullpath parent and exits with it. Only one daemon per user SID exists; a second browser window delegates to the owner. It is not elevated or a service. Config and state directories use owner-only ACLs and reject reparse-point redirection.
+
+## 9. Configuration, lifecycle, and errors
+
+Use `%LOCALAPPDATA%\Nullroute\config.toml`, owner-only ACL. Values are fixed for v3; changed or unknown keys fail validation:
 
 ```toml
-schema_version = 1
-enabled = false
-proxy_bind = "127.0.0.1:14500"
-sam_address = "127.0.0.1:7656"
-connect_timeout_ms = 15000
+schema_version = 3
+socks_bind = "127.0.0.1:14500"
+max_streams = 128
+max_streams_per_context = 32
+max_contexts = 256
+socks_handshake_timeout_ms = 5000
+tor_stream_timeout_ms = 30000
 idle_timeout_ms = 120000
-max_connections = 128
-max_connections_per_exit = 64
-exit_selection = "sticky_per_browser_session"
-exits = [] # array of { destination = "<52-char>.b32.i2p", enabled = true, label = "..." }
 ```
 
-Reject invalid or unknown security-sensitive keys, out-of-range values, wildcard/non-loopback addresses, duplicate Destinations, and malformed `.b32.i2p` values. Never treat configuration parse failure as permission to choose permissive defaults. Write updates atomically (temporary file, flush, rename) and keep ACLs restricted. No proxy credentials or router private keys in this file. The exit list is entered via privileged Nullpath UI or a local administrative CLI, never received from a website.
+No exit list, authority override, router key, proxy secret, or website host is stored. Use atomic same-directory temporary-file/flush/rename writes. Tor directory/guard state resides under `%LOCALAPPDATA%\Nullroute\state\`; aggregate logs under `%LOCALAPPDATA%\Nullroute\logs\`.
 
-**Lifecycle:** `STOPPED -> STARTING -> READY -> DEGRADED -> STOPPING -> STOPPED`. `READY` requires a working SAM HELLO/session plus a successful Nullroute protocol health check through at least one pinned exit; a TCP port listening is not sufficient. `DEGRADED` blocks new proxy requests when no exit passes health checks. On process start, do not create the proxy listener unless `enabled=true` was set by the user's explicit prior choice; the browser itself still starts disconnected as specified in Nullpath. Nullpath's connect action starts or enables the client only after the router is ready. Stop cancels active requests, closes the listener and SAM session, and reports `STOPPED`. Router disappearance enters `DEGRADED` within 5 seconds and does not trigger direct fallback. Retry SAM with bounded exponential backoff (1, 2, 4, 8, 16, 30 seconds, capped at 30, with jitter) while enabled. Any retry remains on the configured loopback endpoint.
+States are `STOPPED` (no process), `STARTING` (local checks, no network), `BOOTSTRAPPING` (directory/circuits), `READY` (SOCKS listener), `DEGRADED` (listener closed, streams cancelled), and `STOPPING` (cancel, flush safe state, exit). `stop` ends retries and streams within 5 seconds. Retry transient bootstrap errors after 1, 2, 4, 8, 16, then 30 seconds plus jitter while user intent remains connected. Never fall back to direct, I2P, system proxy, or unverified directory data.
 
-### Local control interface
+Stable codes: `DIRECTORY_UNAVAILABLE`, `DIRECTORY_INVALID`, `CLOCK_INVALID`, `GUARD_UNAVAILABLE`, `NO_ELIGIBLE_EXIT`, `TOR_CHANNEL_FAILED`, `TOR_CIRCUIT_FAILED`, `EXIT_POLICY_REJECTED`, `SITE_CONNECT_FAILED`, `ONION_ADDRESS_INVALID`, `ONION_DESCRIPTOR_FAILED`, `ONION_AUTH_REQUIRED`, `ONION_INTRO_FAILED`, `ONION_RENDEZVOUS_FAILED`, `CONNECT_TIMEOUT`, `TARGET_DENIED`, `PROXY_AUTH_FAILED`, `INTERNAL_ERROR`. Do not echo raw relay text, hostname, URL, onion address, or secret in an error page. SOCKS failures follow RFC 1928/1929; unknown errors map to general failure. One destination failure need not degrade the daemon.
 
-Use a Windows named pipe `\\.\pipe\nullroute-control-<user SID>` with an ACL permitting only the current user and LocalSystem. Control messages are length-prefixed UTF-8 JSON, at most 16 KiB, with request IDs and `protocol_version=1`. Implement exactly `status`, `start`, `stop`, `set_exits`, and `shutdown`; unknown commands/fields fail. `status` returns state, selected exit **label and pinned Destination**, SAM readiness, active connection count, and a stable reason code, never browsing destinations. Reject connections from another SID. Browser UI must call this through its privileged parent process, not a page/extension or exposed HTTP endpoint. The proxy listener also validates local peer ownership where supported; because loopback alone does not authenticate a Windows process, v1 packaging must restrict it with a per-launch random 256-bit `Proxy-Authorization: Basic` secret supplied only to the dedicated Nullpath profile. The daemon checks it in constant time on **every** proxy request and `CONNECT`, sends `407` on failure, never forwards it, rotates it on restart, and never logs it. If Firefox cannot reliably supply this secret without exposing it to pages/extensions or storing it on disk, integration is blocked: do not ship an unauthenticated local proxy as the default.
+## 10. Target policy and Nullpath integration
 
-## 5. Browser integration contract (implemented in `nullpath`, not here)
+Classify the SOCKS domain before ordinary IDNA validation. A name ending exactly in `.onion` must pass §7A's v3 address parser; it is never treated as clearnet. A clearnet name must be canonical lowercase ASCII IDNA A-label, 1–253 bytes, at least two labels, each 1–63 bytes, no trailing dot, NUL, whitespace, percent escape, slash, colon, userinfo, or numeric-host ambiguity. Reject IPv4/IPv6 literals and clearnet `.i2p`, `.localhost`, `.local`, `.internal`, `.test`, `.invalid`, `localhost`, and single-label names. Port 443 is allowed for either class. Port 80 is allowed for onion HTTP; for clearnet it needs a browser-managed, origin-scoped, session-only insecure-HTTP exception explicitly confirmed by the user. Redirects/scripts cannot create the exception. Nullroute validates class, host, and port; Nullpath enforces scheme and exception. `wss://` uses 443; clearnet `ws://`, UDP, and arbitrary TCP ports are unsupported.
 
-Replace **only** the Direct web profile with a new `Public web via Nullroute` profile. Do not modify I2P-site or conventional-outproxy behavior as part of this change. Reuse Nullpath's separate profile storage and fail-closed channel filter. New profile: fixed HTTP and HTTPS proxy `127.0.0.1:14500`, no proxy bypass list except browser-internal pages that make no network requests, no system proxy fallback, no automatic proxy discovery, no direct DNS/DoH, no speculative connections, no WebRTC direct UDP, and no HTTP/3/QUIC direct path. Browser background services, downloads, redirects, service workers, WebSockets, extensions, updates, and privileged browser requests must be either routed through the same proxy or disabled in that profile. `localhost`, LAN, `.i2p`, IP literals, and router-admin addresses are blocked in this profile; accessing an I2P site requires the I2P-sites profile. Keep a user-visible state label and exit identity. The router button must show Nullroute client readiness separately from router readiness. A blocked or failed page explains the specific layer (router, SAM, exit, policy, destination) and offers retry, never an implicit switch to direct web. Do not relabel an existing direct profile before its traffic paths pass the release tests in §11.
+In `Kayyo321/nullpath`, replace only Direct web with **Public web through Tor**, supporting clearnet and v3 onion addresses. Keep I2P-sites and conventional I2P-outproxy profiles separate. Use fixed authenticated SOCKS5 `127.0.0.1:14500` for HTTP/HTTPS, proxy-side DNS for clearnet, no bypass list/discovery, and no system fallback. Apply the request blocker and final channel filter to every browser request. Block LAN/router targets, `.i2p`, IP literals, unsupported schemes, and malformed/legacy `.onion` names before socket creation. I2P and Tor controls show separate readiness and separate clearnet/onion capability status.
 
-Nullpath currently uses a request blocker plus final proxy channel filter for I2P profiles, and its [network diagram](https://github.com/Kayyo321/nullpath/blob/build/windows-native/docs/nullpath/NETWORK.md) describes `127.0.0.1:14444` for I2P sites and `127.0.0.1:14450` for its managed public-web outproxy. `14500` is reserved here for Nullroute to avoid collision. Nullpath's [router control specification](https://github.com/Kayyo321/nullpath/blob/build/windows-native/docs/nullpath/I2P-ROUTER-TOGGLE.md) starts disconnected and manages i2pd; enabling SAM for a managed router needs an explicit, local-only config change and health check. For a user-managed router, show instructions and require the user to enable SAM themselves. Never assume SAM is enabled merely because its HTTP proxy works.
+Partition cookies, cache, TLS sessions, HSTS, storage, service workers, HTTP authentication, and connection pools by top-level context ID and from other profiles. Disable an unpartitionable store or feature. Disable telemetry, suggestions, captive portal probes, browser updates during the public-web session, DNS/DoH, prefetch/preconnect, safe-browsing network feeds, WebRTC, external protocol handlers, automatic opening of downloads, and network-capable extensions. Route required certificate checks, workers, `wss://`, downloads, and built-in PDF viewing through authenticated SOCKS with the initiating context or block them. No network request uses a shared/unattributed context.
 
-## 6. I2P/SAM session rules
-
-Connect to configured SAM endpoint over loopback TCP, negotiate `HELLO VERSION MIN=3.0 MAX=3.3`, reject unsupported versions, and create `STYLE=STREAM` sessions. The client uses a transient Destination for the lifetime of the daemon session; restart creates a new one. The exit stores a persistent I2P Destination private key in a user-selected file with restrictive ACLs and never replaces it silently. The public `.b32.i2p` identifier is derived from that Destination and displayed to the operator. The client creates a new SAM `STREAM CONNECT ID=<session> DESTINATION=<pinned-exit>` socket for each browser TCP connection. The exit keeps pending `STREAM ACCEPT` sockets and replenishes them up to its concurrency limit. Parse SAM status lines and timeouts strictly; never send application bytes until `RESULT=OK`. If SAM supplies the peer Destination on accept, treat it as a pseudonymous transport identifier, not a real-world identity; do not persist it in logs.
-
-I2P's unidirectional tunnels and garlic routing are provided by the router. Do **not** invent a second hop layer inside Nullroute, claim that one extra application relay is a new garlic hop, or reuse a single client Destination as a promise of unlinkability across sessions. Do not tune tunnel quantity/length without router-specific compatibility and performance tests; v1 uses supported router defaults. Limit SAM endpoints to loopback. A non-loopback SAM deployment is outside v1 because SAM itself does not provide the transport authentication expected across untrusted hosts.
-
-## 7. Nullroute wire protocol v1
-
-All integers are unsigned network byte order. Each I2P stream carries exactly one request and then raw bidirectional TCP bytes. The protocol has no compression, encryption layer, multiplexing, or renegotiation; I2P supplies transport privacy to the exit and HTTPS supplies browser-to-site content confidentiality. Never interpret exit-supplied bytes as configuration.
-
-**Open frame, client to exit (fixed prefix plus host):**
-
-| Offset | Size | Field | Rule |
-| --- | ---: | --- | --- |
-| 0 | 4 | magic | ASCII `NR01` |
-| 4 | 1 | version | `1` |
-| 5 | 1 | command | `1=CONNECT_TCP`, `2=HEALTH` |
-| 6 | 2 | host length | 0 for HEALTH, 1–253 for CONNECT_TCP |
-| 8 | 2 | port | 0 for HEALTH, 80 or 443 for CONNECT_TCP |
-| 10 | N | hostname | ASCII lower-case IDNA A-label, without trailing dot |
-
-There are no extra headers. HEALTH must have exactly the 10-byte frame, return status 0, then close. For CONNECT_TCP, reject embedded NUL, whitespace, percent escapes, `@`, slash, backslash, colon, empty labels, IP literals, `.i2p`, `.localhost`, `.local`, `.internal`, and single-label names. Validate IDNA in one shared parser on client and exit; reject mismatched canonical encoding. Read the entire frame within 10 seconds and cap it at 263 bytes; malformed or extra pre-reply data closes the stream. The exit resolves the validated host and enforces §9 before sending success.
-
-**Reply frame, exit to client:** ASCII `NR01` (4), version `1` (1), status (1), then reason length (2), then UTF-8 reason bytes of 0–256 bytes. Statuses: `0=OK`, `1=BAD_REQUEST`, `2=POLICY_DENIED`, `3=DNS_FAILURE`, `4=CONNECT_FAILURE`, `5=BUSY`, `6=INTERNAL_ERROR`, `7=UNSUPPORTED_VERSION`. Reason is a fixed human-readable class, not resolved IP or private operational data. Once `OK` is sent, both peers switch to opaque, full-duplex byte relay until EOF, timeout, quota, or error. Half-close propagates in both directions. A non-OK reply closes the I2P stream immediately. Client maps statuses to stable local proxy errors and UI reason codes. Unknown versions/statuses fail closed.
-
-Maximum pre-open buffered browser data: 64 KiB per connection. Maximum relay buffer: 64 KiB in each direction, with backpressure. Do not buffer full responses. Timeouts: SAM connect 15 seconds, exit reply 20 seconds, egress DNS 5 seconds, egress TCP connect 10 seconds, idle relay 120 seconds. Active connection hard cap: 30 minutes; limits are configurable downward but not upward without a new reviewed release. Limit overall process memory via connection caps and bounded buffers.
-
-## 8. Browser-facing proxy behavior
-
-Accept HTTP/1.1 only. Reject HTTP/2 prior knowledge, malformed request lines, request smuggling ambiguity (conflicting `Content-Length`, transfer encodings, duplicate `Host`, whitespace before colon), userinfo, and absolute URIs with unsupported schemes. Keep at most one browser request per accepted local TCP connection in v1; send `Connection: close` for HTTP responses. For `CONNECT`, require authority form `host:443` and a matching valid host; open exit stream; reply `HTTP/1.1 200 Connection Established\r\n\r\n` only after exit `OK`, then relay opaque TLS bytes. The client never intercepts TLS, modifies certificate validation, or injects a root certificate.
-
-For plain HTTP, accept only absolute-form `http://host[:80]/path?query`. Require `Host` to match the URI authority after canonicalization. Open exit stream to host:80. Forward an origin-form request line, preserve end-to-end headers/body, remove hop-by-hop headers named by RFC 9110 `Connection` as well as `Proxy-Authorization`, `Proxy-Connection`, `Keep-Alive`, `TE`, `Trailer`, `Transfer-Encoding` only when re-framing is performed, and `Upgrade` unless WebSocket handling is explicitly enabled. V1 deliberately rejects chunked browser request bodies and `Expect: 100-continue`; content-length bodies are streamed with bounded buffers. Never add `Via`, `X-Forwarded-For`, or client IP headers. For HTTP response, pass bytes through without rewriting and close after one response; the parser must recognize framing to avoid response/request desynchronization. WebSocket over HTTPS works inside CONNECT. Plain `ws://` is out of scope and fails explicitly. HTTP origin requests and HTTPS CONNECT must receive the same exit policy. No transparent downgrade from HTTPS to HTTP.
-
-Map proxy failures to `502 Bad Gateway` (exit/destination), `503 Service Unavailable` (router/exit not ready), `504 Gateway Timeout` (timeouts), `403 Forbidden` (policy), or `407 Proxy Authentication Required` (missing local proxy credential). Include a short static error body and `Cache-Control: no-store`; never echo the requested host, credential, URL, or raw exit error in a page visible to websites. Connection errors do not trigger another network path. If multiple exits are configured, one retry may choose another enabled exit **before** any payload bytes are forwarded; never replay a request/body after forwarding begins.
-
-## 9. Exit service and egress policy
-
-The exit is a separately installed, opt-in process. It listens only through its I2P SAM session; it does not expose a public TCP proxy. Operator config lives in `%PROGRAMDATA%\Nullroute\exit\config.toml` when run as a Windows service, with service-account-only ACLs. It contains `schema_version=1`, loopback `sam_address`, persistent destination key path, `max_connections=256`, `max_connections_per_client_destination=16`, `max_new_connections_per_minute=120`, `max_bytes_per_connection=1073741824`, `idle_timeout_ms=120000`, and an explicit public egress interface or default-route policy. Operator must explicitly set `accept_clients=true`; default is false. Apply global and per-client limits; a client Destination is a rate-limit key only, not an account or identity. No paid access or billing in v1.
-
-Allow **TCP only, ports 80 and 443**. Exit performs DNS resolution locally, independently of the client. Reject IP literals, CNAME chains or final A/AAAA answers in loopback, link-local, RFC1918/ULA, carrier-grade NAT, multicast, broadcast, documentation, reserved, unspecified, or other non-global ranges. Check every returned address, select only globally routable addresses, and connect to the exact checked numeric address so DNS rebinding cannot change the destination between check and connect. Recheck on every new connection. Block `.i2p`, `.onion`, `.localhost`, `.local`, `.internal`, and single-label names before DNS. Disable system proxy and proxy environment variables in the exit connector. No cloud metadata service, LAN, router admin, or non-public target may be reached. Redirects are browser requests and must pass the same validation on the next connection.
-
-Use OS DNS as configured on the exit host. An exit operator and their DNS provider can observe DNS queries. No client-side DNS request or DoH endpoint is used. The exit cannot promise that the destination site will accept its traffic. Operators need a documented abuse contact, bandwidth cap, rotation/revocation procedure, and firewall restricting unrelated inbound access. Exit key compromise requires immediate removal of the Destination from client configs; there is no automatic trust rollover. Logs contain counts, aggregate byte totals, error classes, and process health only; no client Destinations, hostnames, URLs, IPs, or payload. Rotate logs and publish the retention period in the operator guide.
-
-## 10. Exit selection, failure, and user experience
-
-V1 ships with an empty exit list. The UI requires the user to enter a full Destination, displays the operator-supplied label as **unverified text**, and warns that the operator can observe metadata/plain HTTP. Health checks verify protocol reachability and exit response, not operator trust, bandwidth, honesty, or ability to reach every site. Choose one healthy exit per browser session and keep it sticky until disconnect, exit failure, or manual change; this reduces surprise IP changes during login. On failure, close affected connections and show a prompt to reconnect or choose a different configured exit. Never automatically choose an exit that the user did not enable. Display the active exit Destination and a short fingerprint; allow copying the full value. Labels are never security identifiers.
-
-Nullpath's router toggle remains the top-level I2P connection control. When router is off, Nullroute is unavailable. When router is on but SAM is off, show `SAM_UNAVAILABLE`. Other stable reason codes: `EXIT_NOT_CONFIGURED`, `EXIT_UNREACHABLE`, `EXIT_REJECTED`, `EXIT_BUSY`, `DESTINATION_DENIED`, `DESTINATION_FAILED`, `LOCAL_PROXY_AUTH_FAILED`, `ROUTER_DISCONNECTED`, and `INTERNAL_ERROR`. All transitions must be conveyed by text and accessible status, not color alone. The browser continues to start disconnected, as its current specification requires.
+Implement and independently review fingerprint resistance for user agent, platform, fonts, canvas, WebGL, screen size, locale, timezone, media devices, and storage. Compare with Tor Browser; proxy settings alone are insufficient. UI shows disconnected, bootstrapping, connected through Tor, or a stable failure. It never asks for an outproxy/exit or silently switches modes.
 
 ## 11. Verification and release gates
 
-Implementation is complete only when automated tests and a human-readable network trace cover:
+CI uses fake directory authorities, relays, exits, origins, and fault injection without contacting the public Tor network. Required evidence:
 
-1. Protocol golden vectors, version mismatch, truncation, oversized frames, invalid IDNA, malformed replies, half-close, cancellation, buffering, and slow-peer resource limits.
-2. Local proxy parsing: HTTP GET/POST, HTTPS CONNECT, nested redirects, downloads, service workers, HTTPS WebSocket, header smuggling attempts, malformed authority, proxy authentication, absent exit, and each status mapping.
-3. Exit policy: blocked private/reserved IPv4 and IPv6, CNAME to private space, DNS rebinding, mixed public/private answers, DNS failure, ports other than 80/443, IP literals, invalid hostnames, exhausted quotas, and concurrency races.
-4. Router/SAM faults: absent SAM, wrong version, session rejection, bridge restart, stream timeout, exit disappearance mid-transfer, exit change while connected, client crash/restart, and router shutdown. Every case must fail closed.
-5. End-to-end Nullpath integration for each browser request class: address bar, iframe/subresources, redirects, downloads, service workers, extensions, updates/background fetch, WebRTC, DoH, prefetch, WebSocket, localhost/LAN attempts, router admin, and `.i2p` handling. Capture traffic at the client host and assert **no public-website DNS or TCP/UDP from `nullpath.exe` or `nullroute-client.exe`**. Router peer/reseed connections are separately identified and explained.
-6. Independent external observation: controlled website logs show only the exit IP; controlled DNS logs show queries at the exit and none at the client. HTTPS certificate warnings remain effective under a malicious exit; no TLS interception occurs.
-7. Windows installer/service tests: standard-user installation, separate exit consent, ACLs, upgrade, rollback, process ownership, port collision, uninstallation, and no stale proxy configuration that enables direct fallback.
+1. Golden vectors and differential tests against current upstream Tor behavior for directory signatures, TLS/link negotiation, cells, ntor, hop keys, relay encryption/digests, `SENDME`, streams, v3 onion-address checksums, blinded identities, descriptors, introduction, and rendezvous. Fuzz truncation, size limits, invalid order, and cancellation.
+2. Guard/path tests for weights, family/subnet constraints, exit policy, protocol versions, persistence, guard failure, consensus rollover, and no eligible exit. Contexts must not share circuits. Onion introduction/rendezvous circuits must never become clearnet exit circuits.
+3. Leak tests showing zero website or onion-name DNS/direct TCP/UDP from Nullpath or Nullroute. Nullroute non-loopback packets must be explainable as directory/relay traffic. Test IPv4/IPv6, crashes, offline, stale/forged consensus, clock error, channel/circuit failure, exit disappearance, HSDir failure, bad onion descriptor, and failed rendezvous. Every fault fails closed.
+4. Browser matrix: address bar, redirects, frames, workers, downloads, extensions, updates, WebRTC, DoH, prefetch, WebSocket, OCSP, local/LAN/router targets, `.i2p`, valid/malformed/legacy `.onion`, onion HTTP/HTTPS, login state, new identity, and all profile transitions. Check proxy secret exposure, context storage, and direct packets.
+5. Windows tests for signed binaries/manifest, standard-user installation, ACLs, process ownership, second window, port collision, update/rollback, uninstall, and crash recovery.
+6. Opt-in real-network staging with controlled clearnet HTTPS/DNS observers and a controlled public v3 onion service. The clearnet site must see only a Tor exit IP; client DNS must see neither website nor onion name. The onion service must work without a clearnet exit, and a deliberately invalid onion descriptor must fail. HTTPS warnings remain effective. Record build ID, pinned Tor-spec revision, commands, sanitized capture method, SBOM, dependency audit, failures, and limitations.
 
-CI must run unit/integration tests with fake SAM and local fake origins without touching the public internet. A separate, explicitly enabled staging job exercises real I2P against a dedicated test exit. Do not advertise or enable the new browser mode by default until leak tests, exit policy tests, independent security review, and operator documentation are complete. Publish exact release versions, test commands/results, packet-capture methodology, known limitations, and a reproducible-build or signed-binary provenance record. Never equate passing tests with a mathematical anonymity guarantee.
+Release is blocked until the live Tor network accepts the client, conformance tests pass, independent review covers protocol/crypto/state code, and Nullpath leak and fingerprint reviews pass. Passing tests does not prove perfect anonymity.
 
-## 12. Implementation order and acceptance criteria
+## 12. Implementation order
 
-1. **Protocol/testkit:** implement shared parsers, golden vectors, fake SAM and fake exit; accept only when malformed inputs cannot panic or allocate unbounded memory.
-2. **Exit:** persistent Destination handling, SAM accept, DNS/egress policy, quotas, relay; accept only when private targets and rebind cases fail in tests and no public listener exists.
-3. **Client:** loopback authenticated proxy, SAM connect, protocol handshake, health/state/IPC, bounded relay; accept only when no direct website socket or DNS lookup is possible in fault tests.
-4. **Windows packaging:** client installer and separately consented exit service, ACLs, upgrade/removal; accept only after standard-user and service-account tests.
-5. **Nullpath integration in its own repository:** replace direct profile, wire status/controls, enforce proxy and request policy; accept only after the full §11 network trace passes.
-6. **Review and limited release:** security review, threat-model correction, operator documentation, staging exit, performance and abuse monitoring; enable for testers with explicit experimental wording before any broad release.
+1. Pin Tor-spec revision and supported protocol versions; build parsers, golden vectors, and fuzz/testkit.
+2. Implement authenticated directory bootstrap and guard/path state. No browser proxy yet.
+3. Implement TLS channel, ntor circuit, onion layers, relay cells, flow control, and clearnet streams against fake relays, then differential and real-network interoperability tests.
+4. Implement v3 onion-address validation, HSDir descriptor verification, introduction, rendezvous, and service streams against fake services, then controlled real-network onion interoperability tests.
+5. Add authenticated SOCKS5, control IPC, target policy, bounded relay, and lifecycle. Prove there is no direct website or onion-name DNS/socket path.
+6. Bundle with Nullpath and implement context credentials, state partitioning, and fail-closed routing in its repository.
+7. Complete independent security review and experimental release evidence.
 
-For all ambiguous implementation details, choose the behavior that refuses the request and records a non-sensitive reason code. Changes to the fixed security decisions, wire protocol, or trust model require a documented revision to this file before code is changed.
+Ambiguous input, signature, cell, state, or route is rejected with a non-sensitive reason. New protocol features require a versioned specification update and conformance tests.
 
 ## 13. Primary references
 
-- [Nullpath browser branch](https://github.com/Kayyo321/nullpath/tree/build/windows-native), [network paths](https://github.com/Kayyo321/nullpath/blob/build/windows-native/docs/nullpath/NETWORK.md), [router control specification](https://github.com/Kayyo321/nullpath/blob/build/windows-native/docs/nullpath/I2P-ROUTER-TOGGLE.md).
-- [I2P FAQ](https://i2p.net/en/docs/overview/faq/) — outproxies are opt-in services and I2P is primarily an internal network.
-- [I2P SAM v3 specification](https://i2p.net/en/docs/api/samv3/) — session creation and streaming connect/accept semantics.
-- [I2P garlic routing](https://i2p.net/en/docs/overview/garlic-routing/) and [tunnel routing](https://i2p.net/en/docs/overview/tunnel-routing/) — I2P's existing routing model.
-- [RFC 9110 HTTP Semantics](https://www.rfc-editor.org/rfc/rfc9110) and [RFC 9112 HTTP/1.1](https://www.rfc-editor.org/rfc/rfc9112) — proxy request forms, CONNECT, headers, and framing.
+- [Tor protocol introduction](https://spec.torproject.org/intro/), [channel negotiation](https://spec.torproject.org/tor-spec/negotiating-channels.html), [circuit creation](https://spec.torproject.org/tor-spec/creating-circuits.html), [relay cells](https://spec.torproject.org/tor-spec/relay-cells.html), [relay-cell encryption](https://spec.torproject.org/tor-spec/routing-relay-cells.html), and [flow control](https://spec.torproject.org/tor-spec/flow-control.html).
+- [Tor directory specification](https://spec.torproject.org/dir-spec/), [path selection](https://spec.torproject.org/path-spec/), [guard selection](https://spec.torproject.org/guard-spec/guard-selection/), and [stream isolation](https://spec.torproject.org/path-spec/stream-isolation.html).
+- [Tor v3 onion-service protocol](https://spec.torproject.org/rend-spec/), [onion-address encoding](https://spec.torproject.org/rend-spec/encoding-onion-addresses.html), [introduction](https://spec.torproject.org/rend-spec/introduction-protocol.html), and [rendezvous](https://spec.torproject.org/rend-spec/rendezvous-protocol.html).
+- [I2P garlic routing and cloves](https://i2p.net/en/docs/overview/garlic-routing/); this distinguishes layered encryption from multi-message bundling.
+- [Tor warning about other browsers](https://support.torproject.org/tor-browser/security/using-tor-with-other-browsers/) and [Tor Browser fingerprint protections](https://support.torproject.org/tor-browser/features/fingerprinting-protections/).
+- [SOCKS5 RFC 1928](https://www.rfc-editor.org/rfc/rfc1928) and [username/password RFC 1929](https://www.rfc-editor.org/rfc/rfc1929).
+- [Nullpath branch](https://github.com/Kayyo321/nullpath/tree/build/windows-native), [network paths](https://github.com/Kayyo321/nullpath/blob/build/windows-native/docs/nullpath/NETWORK.md), and [router controls](https://github.com/Kayyo321/nullpath/blob/build/windows-native/docs/nullpath/I2P-ROUTER-TOGGLE.md).
